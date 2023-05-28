@@ -3,80 +3,108 @@ package main
 import (
 	"bufio"
 	"context"
+	"fmt"
 	"log"
 	"os"
 	"strings"
+	"sync"
 
 	"google.golang.org/grpc"
 
 	pb "github.com/maulerrr/chatapp/protobuf/pb"
 )
 
+const (
+	grpcServerAddr = "localhost:50051"
+)
+
+var printLock sync.Mutex
+
+func receiveMessages(stream pb.Chat_ReceiveMessageClient, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	for {
+		chatMsg, err := stream.Recv()
+		if err != nil {
+			log.Fatalf("Failed to receive a message from the server: %v", err)
+		}
+
+		printLock.Lock()
+		fmt.Printf("%s\n", chatMsg.User+": "+chatMsg.Content)
+		printLock.Unlock()
+	}
+}
+
 func main() {
-	conn, err := grpc.Dial("localhost:50051", grpc.WithInsecure())
+	if len(os.Args) != 2 {
+		log.Fatalf("Usage: go run ./client/client.go <username>")
+	}
+
+	username := os.Args[1]
+
+	conn, err := grpc.Dial(grpcServerAddr, grpc.WithInsecure())
 	if err != nil {
 		log.Fatalf("Failed to connect: %v", err)
 	}
 	defer conn.Close()
 
-	client := pb.NewChatServiceClient(conn)
+	client := pb.NewChatClient(conn)
+
+	sendWg := sync.WaitGroup{}
+	receiveWg := sync.WaitGroup{}
+
+	sendWg.Add(1)
+	receiveWg.Add(1)
+
+	stream, err := client.ReceiveMessage(context.Background(), &pb.Empty{})
+	if err != nil {
+		log.Fatalf("Failed to receive messages from the server: %v", err)
+	}
+
+	go receiveMessages(stream, &receiveWg)
 
 	reader := bufio.NewReader(os.Stdin)
 
-	log.Print("Enter your username: ")
-	username, _ := reader.ReadString('\n')
-	username = strings.TrimSpace(username)
-
-	stream, err := client.JoinChannel(context.Background(), &pb.ChannelRequest{Username: username})
-	if err != nil {
-		log.Fatalf("Error joining channel: %v", err)
-	}
-
-	go func() {
-		for {
-			msg, err := stream.Recv()
-			if err != nil {
-				log.Fatalf("Error receiving message: %v", err)
-			}
-
-			log.Printf("[%s]: %s", msg.Sender, msg.Content)
-		}
-	}()
+	fmt.Printf("Welcome, %s!\n", username)
 
 	for {
-		log.Print("Enter message: ")
-		message, _ := reader.ReadString('\n')
-		message = strings.TrimSpace(message)
+		//fmt.Print(username + ": ")
+		userInput, err := reader.ReadString('\n')
+		if err != nil {
+			log.Fatalf("Failed to read user input: %v", err)
+		}
+		userInput = strings.TrimSuffix(userInput, "\n") // remove the newline character
 
-		if message == "" {
-			continue
+		if userInput == "/exit" {
+			break
 		}
 
-		split := strings.SplitN(message, "#", 3)
-		if len(split) == 3 && split[0] == "" {
-			recipient := strings.TrimSpace(split[1])
-			content := strings.TrimSpace(split[2])
+		sendWg.Add(1)
 
-			req := &pb.MessageRequest{
-				Sender:    username,
-				Recipient: recipient,
-				Content:   content,
-			}
-
-			_, err := client.SendMessage(context.Background(), req)
-			if err != nil {
-				log.Fatalf("Error sending message: %v", err)
-			}
+		if userInput == "" {
+			log.Println("Cannot send empty messages..")
 		} else {
-			req := &pb.MessageRequest{
-				Sender:  username,
-				Content: message,
-			}
+			go func() {
+				defer sendWg.Done()
 
-			_, err := client.SendMessage(context.Background(), req)
-			if err != nil {
-				log.Fatalf("Error sending message: %v", err)
-			}
+				_, err := client.SendMessage(context.Background(), &pb.Message{
+					User:    username,
+					Content: userInput,
+				})
+				if err != nil {
+					log.Fatalf("Failed to send a message to the server: %v", err)
+				}
+			}()
 		}
+
 	}
+
+	sendWg.Wait()
+
+	err = stream.CloseSend()
+	if err != nil {
+		log.Fatalf("Failed to close the stream: %v", err)
+	}
+
+	receiveWg.Wait()
 }

@@ -4,22 +4,14 @@ package protobuf;
 
 option go_package="./pb";
 
-service ChatService {
-  rpc JoinChannel(ChannelRequest) returns (stream MessageResponse) {}
-  rpc SendMessage(MessageRequest) returns (MessageResponse) {}
+service Chat {
+  rpc SendMessage(Message) returns (Empty) {}
+  rpc ReceiveMessage(Empty) returns (stream Message) {}
 }
 
-message ChannelRequest {
-  string username = 1;
-}
-
-message MessageRequest {
-  string sender = 1;
-  string recipient = 2;
-  string content = 3;
-}
-
-message MessageResponse {
-  string sender = 1;
+message Message {
+  string user = 1;
   string content = 2;
 }
+
+message Empty {}

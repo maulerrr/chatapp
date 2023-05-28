@@ -2,53 +2,123 @@ package main
 
 import (
 	"context"
-	"google.golang.org/grpc/codes"
 	"log"
 	"net"
-	"sync"
 
-	"github.com/golang/protobuf/proto"
 	"github.com/streadway/amqp"
 	"google.golang.org/grpc"
 
 	pb "github.com/maulerrr/chatapp/protobuf/pb"
 )
 
-type chatServer struct {
-	pb.UnimplementedChatServiceServer
+const (
+	rabbitMQURL    = "amqp://guest:guest@localhost:5672/"
+	exchangeName   = "chat_exchange"
+	exchangeType   = "direct"
+	queueName      = "chat_queue"
+	routingKey     = "chat_messages"
+	grpcServerPort = ":50051"
+)
+
+type server struct {
+	pb.UnimplementedChatServer
 }
 
-type channel struct {
-	name     string
-	messages []pb.MessageResponse
-	sync.Mutex
+func (s *server) SendMessage(ctx context.Context, msg *pb.Message) (*pb.Empty, error) {
+	conn, err := amqp.Dial(rabbitMQURL)
+	if err != nil {
+		log.Fatalf("Failed to connect to RabbitMQ: %v", err)
+	}
+	defer conn.Close()
+
+	ch, err := conn.Channel()
+	if err != nil {
+		log.Fatalf("Failed to open a channel: %v", err)
+	}
+	defer ch.Close()
+
+	err = ch.ExchangeDeclare(
+		exchangeName,
+		exchangeType,
+		true,
+		false,
+		false,
+		false,
+		nil,
+	)
+	if err != nil {
+		log.Fatalf("Failed to declare an exchange: %v", err)
+	}
+
+	body := "[" + msg.User + "]: " + msg.Content
+	err = ch.Publish(
+		exchangeName,
+		routingKey,
+		false,
+		false,
+		amqp.Publishing{
+			ContentType: "text/plain",
+			Body:        []byte(body),
+		},
+	)
+	if err != nil {
+		log.Fatalf("Failed to publish a message: %v", err)
+	}
+
+	return &pb.Empty{}, nil
 }
 
-var channels map[string]*channel
-var conn *amqp.Connection
-var ch *amqp.Channel
+func (s *server) ReceiveMessage(empty *pb.Empty, stream pb.Chat_ReceiveMessageServer) error {
+	conn, err := amqp.Dial(rabbitMQURL)
+	if err != nil {
+		log.Fatalf("Failed to connect to RabbitMQ: %v", err)
+	}
+	defer conn.Close()
 
-func (s *chatServer) JoinChannel(req *pb.ChannelRequest, stream pb.ChatService_JoinChannelServer) error {
-	channelName := req.Username
+	ch, err := conn.Channel()
+	if err != nil {
+		log.Fatalf("Failed to open a channel: %v", err)
+	}
+	defer ch.Close()
 
-	if _, ok := channels[channelName]; !ok {
-		channels[channelName] = &channel{
-			name: channelName,
-		}
+	err = ch.ExchangeDeclare(
+		exchangeName,
+		exchangeType,
+		true,
+		false,
+		false,
+		false,
+		nil,
+	)
+	if err != nil {
+		log.Fatalf("Failed to declare an exchange: %v", err)
 	}
 
-	currentChannel := channels[channelName]
-
-	for _, msg := range currentChannel.messages {
-		if err := stream.Send(&msg); err != nil {
-			return err
-		}
+	q, err := ch.QueueDeclare(
+		queueName,
+		true,
+		false,
+		false,
+		false,
+		nil,
+	)
+	if err != nil {
+		log.Fatalf("Failed to declare a queue: %v", err)
 	}
 
-	ch.QueueBind(channelName, channelName, "chat-exchange", false, nil)
+	err = ch.QueueBind(
+		q.Name,
+		routingKey,
+		exchangeName,
+		false,
+		nil,
+	)
+	if err != nil {
+		log.Fatalf("Failed to bind a queue: %v", err)
+	}
 
 	msgs, err := ch.Consume(
-		channelName,
+		q.Name,
 		"",
 		true,
 		false,
@@ -57,118 +127,32 @@ func (s *chatServer) JoinChannel(req *pb.ChannelRequest, stream pb.ChatService_J
 		nil,
 	)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("Failed to register a consumer: %v", err)
 	}
 
 	for msg := range msgs {
-		var message pb.MessageResponse
-		err := proto.Unmarshal(msg.Body, &message)
-		if err != nil {
-			log.Fatal(err)
+		chatMsg := &pb.Message{
+			User:    "",
+			Content: string(msg.Body),
 		}
 
-		if err := stream.Send(&message); err != nil {
-			return err
+		err = stream.Send(chatMsg)
+		if err != nil {
+			log.Fatalf("Failed to send a message to the client: %v", err)
 		}
 	}
 
 	return nil
 }
 
-func (s *chatServer) SendMessage(ctx context.Context, req *pb.MessageRequest) (*pb.MessageResponse, error) {
-	sender := req.Sender
-	recipient := req.Recipient
-	content := req.Content
-
-	message := &pb.MessageResponse{
-		Sender:  sender,
-		Content: content,
-	}
-
-	if recipient != "" {
-		if _, ok := channels[recipient]; ok {
-			ch.Publish(
-				"chat-exchange",
-				recipient,
-				false,
-				false,
-				amqp.Publishing{
-					ContentType: "text/plain",
-					Body:        []byte(proto.MarshalTextString(message)),
-				},
-			)
-		} else {
-			return nil, grpc.Errorf(codes.NotFound, "Recipient not found")
-		}
-	} else {
-		for _, channel := range channels {
-			channel.Lock()
-			channel.messages = append(channel.messages, *message)
-			channel.Unlock()
-
-			ch.Publish(
-				"chat-exchange",
-				channel.name,
-				false,
-				false,
-				amqp.Publishing{
-					ContentType: "text/plain",
-					Body:        []byte(proto.MarshalTextString(message)),
-				},
-			)
-		}
-	}
-
-	return message, nil
-}
-
 func main() {
-	lis, err := net.Listen("tcp", ":50051")
+	lis, err := net.Listen("tcp", grpcServerPort)
 	if err != nil {
 		log.Fatalf("Failed to listen: %v", err)
 	}
-
-	amqpConn, err := amqp.Dial("amqp://guest:guest@localhost:5672/")
-	if err != nil {
-		log.Fatalf("Failed to connect to RabbitMQ: %v", err)
-	}
-	conn = amqpConn
-
-	amqpChannel, err := conn.Channel()
-	if err != nil {
-		log.Fatalf("Failed to open a RabbitMQ channel: %v", err)
-	}
-	ch = amqpChannel
-
-	ch.ExchangeDeclare(
-		"chat-exchange",
-		"direct",
-		true,
-		false,
-		false,
-		false,
-		nil,
-	)
-
-	defer func(conn *amqp.Connection) {
-		err := conn.Close()
-		if err != nil {
-			log.Println("Error in connection..")
-		}
-	}(conn)
-	defer func(ch *amqp.Channel) {
-		err := ch.Close()
-		if err != nil {
-			log.Println("Error in channel..")
-		}
-	}(ch)
-
-	channels = make(map[string]*channel)
-
 	s := grpc.NewServer()
-	pb.RegisterChatServiceServer(s, &chatServer{})
-
-	log.Println("Chat server started")
+	pb.RegisterChatServer(s, &server{})
+	log.Println("gRPC server listening on", grpcServerPort)
 	if err := s.Serve(lis); err != nil {
 		log.Fatalf("Failed to serve: %v", err)
 	}
